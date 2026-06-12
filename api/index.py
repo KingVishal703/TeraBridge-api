@@ -27,6 +27,7 @@ CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL", 60))         # Cache respons
 CACHE_MAX_ENTRIES = int(os.environ.get("CACHE_MAX_ENTRIES", 256)) # LRU eviction after 256 entries
 RATE_LIMIT_RPM    = int(os.environ.get("RATE_LIMIT_RPM", 30))    # 30 requests per minute per IP
 RATE_LIMIT_WINDOW = 60  # seconds
+API_KEY           = os.environ.get("API_KEY")                    # API Key for securing endpoints
 
 # ─── Thread-safe LRU Cache ──────────────────────────────────────────
 class ResponseCache:
@@ -155,6 +156,35 @@ def _periodic_cleanup():
 _cleanup_thread = threading.Thread(target=_periodic_cleanup, daemon=True)
 _cleanup_thread.start()
 
+# ─── API Key Verification Helper ────────────────────────────────────
+def check_auth():
+    if not API_KEY:
+        return True
+    
+    # 1. Check custom header
+    client_key = request.headers.get("X-API-Key")
+    
+    # 2. Check standard Authorization header
+    if not client_key:
+        auth_header = request.headers.get("Authorization") or ""
+        if auth_header.startswith("Bearer "):
+            client_key = auth_header[7:].strip()
+            
+    # 3. Check query parameters (fallback for media players/browser requests)
+    if not client_key:
+        client_key = request.args.get("key") or request.args.get("api_key")
+        
+    # 4. Check JSON body if applicable
+    if not client_key and request.is_json:
+        try:
+            client_key = request.json.get("key") or request.json.get("api_key")
+        except Exception:
+            pass
+        
+    return client_key == API_KEY
+
+
+
 # ─── Startup timestamp ──────────────────────────────────────────────
 _start_time = time.time()
 
@@ -177,6 +207,8 @@ def home():
 @app.route("/api/stats")
 def stats():
     """Observability endpoint for cache and rate limiter metrics."""
+    if not check_auth():
+        return jsonify({"status": "error", "message": "Unauthorized: Invalid or missing API key."}), 401
     uptime = int(time.time() - _start_time)
     return jsonify({
         "status": "online",
@@ -187,6 +219,9 @@ def stats():
 
 @app.route("/api/resolve", methods=["GET", "POST"])
 def resolve():
+    if not check_auth():
+        return jsonify({"status": "error", "message": "Unauthorized: Invalid or missing API key."}), 401
+
     # ── Rate Limiting ──
     client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
     if client_ip:
@@ -306,6 +341,9 @@ def stream_manifest():
         resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
         return resp
 
+    if not check_auth():
+        return jsonify({"status": "error", "message": "Unauthorized: Invalid or missing API key."}), 401
+
     # ── Rate Limiting ──
     client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
     if client_ip:
@@ -374,6 +412,8 @@ def stream_manifest():
             if line_stripped and not line_stripped.startswith("#"):
                 quoted_url = urllib.parse.quote(line_stripped)
                 proxy_url = f"{request.scheme}://{request.host}/api/stream/segment?url={quoted_url}"
+                if API_KEY:
+                    proxy_url += f"&key={API_KEY}"
                 proxied_lines.append(proxy_url)
             else:
                 proxied_lines.append(line)
@@ -399,6 +439,9 @@ def stream_segment():
         resp.headers["Access-Control-Allow-Headers"] = "*"
         resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
         return resp
+
+    if not check_auth():
+        return "Unauthorized: Invalid or missing API key.", 401
 
     url = request.args.get("url") or ""
     if not url:
