@@ -18,7 +18,7 @@ except ImportError:
 # Add the project root directory to sys.path to resolve downloader module
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from downloader import resolve_link, session
+from downloader import resolve_link, session, parse_surl, UA, COOKIES_DICT
 
 app = Flask(__name__)
 
@@ -315,17 +315,33 @@ def resolve():
             "files": []
         }
 
+        surl = parse_surl(link)
+        print(f"[DEBUG] link={link} parsed surl={surl}", flush=True)
         for f in res.get("files", []):
+            original_fs_id = f.get("original_fs_id")
+            print(f"[DEBUG] file={f.get('filename')} original_fs_id={original_fs_id} fs_id={f.get('fs_id')}", flush=True)
             raw_thumbs = f.get("thumbnails")
             proxied_thumbs = {}
             if raw_thumbs and isinstance(raw_thumbs, dict):
                 for k, v in raw_thumbs.items():
                     if v:
-                        quoted_v = urllib.parse.quote(v)
-                        proxy_url = f"{request.scheme}://{request.host}/api/thumbnail?url={quoted_v}"
+                        if original_fs_id and surl:
+                            proxy_url = f"{request.scheme}://{request.host}/api/thumbnail?surl={surl}&fs_id={original_fs_id}&size_type={k}"
+                        else:
+                            quoted_v = urllib.parse.quote(v)
+                            proxy_url = f"{request.scheme}://{request.host}/api/thumbnail?url={quoted_v}"
                         if API_KEY:
                             proxy_url += f"&key={API_KEY}"
                         proxied_thumbs[k] = proxy_url
+
+            # Shortened download proxy link
+            dlink_url = f.get("dlink")
+            if dlink_url and original_fs_id and surl:
+                proxy_dlink = f"{request.scheme}://{request.host}/api/download?surl={surl}&fs_id={original_fs_id}"
+                if API_KEY:
+                    proxy_dlink += f"&key={API_KEY}"
+            else:
+                proxy_dlink = dlink_url
 
             file_info = {
                 "filename": f.get("filename"),
@@ -333,7 +349,7 @@ def resolve():
                 "size_mb": f.get("size_mb"),
                 "fs_id": f.get("fs_id"),
                 "transfer_status": f.get("transfer_status"),
-                "dlink": f.get("dlink"),
+                "dlink": proxy_dlink,
                 "stream_ready": f.get("stream_ready"),
                 "error": f.get("error"),
                 "thumbnails": proxied_thumbs if proxied_thumbs else None,
@@ -548,10 +564,42 @@ def stream_thumbnail():
         return "Unauthorized: Invalid or missing API key.", 401
 
     url = request.args.get("url") or ""
-    if not url:
-        return "Missing thumbnail URL", 400
+    surl = request.args.get("surl") or ""
+    fs_id = request.args.get("fs_id") or ""
+    size_type = request.args.get("size_type") or request.args.get("size") or "url3"
 
-    target_url = urllib.parse.unquote(url)
+    if not url and not (surl and fs_id):
+        return "Missing thumbnail URL or surl/fs_id parameters", 400
+
+    target_url = ""
+    if url:
+        target_url = urllib.parse.unquote(url)
+    else:
+        # Resolve from surl and fs_id
+        share_url = f"https://1024terabox.com/s/{surl}"
+        cached_res = cache.get(share_url, "d", False) or cache.get(share_url, "l", False)
+        if not cached_res:
+            try:
+                cached_res = resolve_link(share_url, action="l")
+            except Exception as e:
+                return f"Failed to resolve share link metadata: {str(e)}", 500
+        
+        target_file = None
+        for f in cached_res.get("files", []):
+            if str(f.get("original_fs_id")) == str(fs_id) or str(f.get("fs_id")) == str(fs_id):
+                target_file = f
+                break
+        
+        if not target_file:
+            return "File not found in share link", 404
+        
+        thumbs = target_file.get("thumbnails")
+        if not thumbs or not isinstance(thumbs, dict):
+            return "No thumbnails available for this file", 404
+        
+        target_url = thumbs.get(size_type) or thumbs.get("url3") or thumbs.get("original") or list(thumbs.values())[0]
+        if not target_url:
+            return "No matching thumbnail URL found", 404
 
     # SSRF Protection
     try:
@@ -603,6 +651,108 @@ def stream_thumbnail():
 
     except Exception as e:
         return f"Thumbnail proxy encountered an error: {str(e)}", 500
+
+
+@app.route("/api/download", methods=["GET", "OPTIONS"])
+def download_file_route():
+    if request.method == "OPTIONS":
+        resp = Response()
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        return resp
+
+    if not check_auth():
+        return "Unauthorized: Invalid or missing API key.", 401
+
+    surl = request.args.get("surl") or ""
+    fs_id = request.args.get("fs_id") or ""
+
+    if not surl or not fs_id:
+        return "Missing required parameters: surl and fs_id", 400
+
+    share_url = f"https://1024terabox.com/s/{surl}"
+    cached_res = cache.get(share_url, "d", False)
+    if not cached_res:
+        try:
+            cached_res = resolve_link(share_url, action="d")
+            if cached_res.get("errno") == 0:
+                is_transcoding = any(f.get("error") == "transcoding_in_progress" for f in cached_res.get("files", []))
+                if not is_transcoding:
+                    cache.put(share_url, "d", False, cached_res)
+        except Exception as e:
+            return f"Failed to resolve download details: {str(e)}", 500
+
+    if cached_res.get("errno") != 0:
+        return f"Failed to resolve share link: {cached_res.get('error', 'Unknown error')}", 400
+
+    target_file = None
+    for f in cached_res.get("files", []):
+        if str(f.get("original_fs_id")) == str(fs_id) or str(f.get("fs_id")) == str(fs_id):
+            target_file = f
+            break
+
+    if not target_file:
+        return "File not found in share link", 404
+
+    if target_file.get("error"):
+        return f"File resolution error: {target_file.get('error')}", 400
+
+    dlink = target_file.get("dlink")
+    filename = target_file.get("filename") or "download"
+
+    if not dlink:
+        return "Download link not available for this file", 404
+
+    try:
+        headers = {
+            "User-Agent": UA,
+            "Referer": "https://dm.1024terabox.com/",
+        }
+        cookies = COOKIES_DICT
+
+        range_header = request.headers.get("Range")
+        if range_header:
+            headers["Range"] = range_header
+
+        req = session.get(
+            dlink,
+            headers=headers,
+            cookies=cookies,
+            stream=True,
+            allow_redirects=True,
+            timeout=120
+        )
+
+        resp_headers = {}
+        for key in ("Content-Length", "Content-Type", "Content-Range", "Accept-Ranges"):
+            if key in req.headers:
+                resp_headers[key] = req.headers[key]
+
+        if "Content-Type" not in resp_headers:
+            resp_headers["Content-Type"] = "application/octet-stream"
+
+        quoted_filename = urllib.parse.quote(filename)
+        resp_headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quoted_filename}"
+
+        resp_headers.update({
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+        })
+
+        def generate():
+            try:
+                for chunk in req.iter_content(chunk_size=131072):
+                    if chunk:
+                        yield chunk
+            finally:
+                req.close()
+
+        return Response(generate(), status=req.status_code, headers=resp_headers)
+
+    except Exception as e:
+        return f"Download proxy encountered an error: {str(e)}", 500
 
 
 # ─── Server Entry Point ─────────────────────────────────────────────
