@@ -685,7 +685,7 @@ def stream_segment():
     if not url:
         return "Missing segment URL", 400
 
-    target_url = urllib.parse.unquote(url)
+    target_url = url
 
     # Authorize either via master key OR via valid signature
     if not check_auth() and not verify_signature(target_url, "", "", sig):
@@ -797,7 +797,7 @@ def stream_thumbnail():
 
     target_url = ""
     if url:
-        target_url = urllib.parse.unquote(url)
+        target_url = url
     else:
         # Resolve from surl and fs_id
         share_url = f"https://1024terabox.com/s/{surl}"
