@@ -320,8 +320,8 @@ def resolve_link(link, action="d", wait_for_transcoding=False):
                     file_res["error"] = f"Streaming request exception: {e}"
                     break
         
-        # --- ACTION DOWNLOAD ---
-        elif action == "d":
+        # --- ACTION DOWNLOAD (or fallback when stream not ready) ---
+        if action == "d" or (action == "s" and not file_res["stream_ready"]):
             # Direct link resolution via filemetas (which is robust and works without sign/timestamp)
             metas_url = f"{BASE_API}/api/filemetas?{qp()}&fsids=[\"{my_fs_id}\"]&dlink=1&thumb=0&bdstoken={BDSTOKEN}"
             try:
@@ -334,10 +334,11 @@ def resolve_link(link, action="d", wait_for_transcoding=False):
                         break
                 if dlink:
                     file_res["dlink"] = dlink
-                else:
+                elif action == "d":
                     file_res["error"] = "Failed to resolve direct download link (dlink) from filemetas."
             except Exception as e:
-                file_res["error"] = f"filemetas query failed: {e}"
+                if action == "d":
+                    file_res["error"] = f"filemetas query failed: {e}"
 
         results.append(file_res)
 
