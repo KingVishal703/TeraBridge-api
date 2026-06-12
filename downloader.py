@@ -286,39 +286,83 @@ def resolve_link(link, action="d", wait_for_transcoding=False):
             if not my_file_path:
                 my_file_path = ROOT_PATH.rstrip("/") + "/" + filename
             encoded_path = urllib.parse.quote(my_file_path)
-            stream_url = f"{BASE_API}/api/streaming?{qp()}&path={encoded_path}&type=M3U8_AUTO_720&bdstoken={BDSTOKEN}"
             
-            # If wait_for_transcoding is True, retry up to 6 times. Otherwise try once.
-            max_retries = 6 if wait_for_transcoding else 1
-            retry_delay = 10
+            # Try multiple stream quality types — highest first
+            stream_types = ["M3U8_AUTO_720", "M3U8_AUTO_480", "M3U8_AUTO_360"]
             
-            for attempt in range(1, max_retries + 1):
+            def _try_stream(stype):
+                """Try a single streaming request. Returns (success, errno, response_text)."""
+                url = f"{BASE_API}/api/streaming?{qp()}&path={encoded_path}&type={stype}&bdstoken={BDSTOKEN}"
                 try:
-                    sr = session.get(stream_url)
+                    sr = session.get(url, timeout=20)
                     if sr.status_code == 200 and "#EXTM3U" in sr.text:
-                        file_res["stream_ready"] = True
-                        file_res["stream_m3u8"] = sr.text
-                        break
-                    
+                        return True, 0, sr.text
                     err_code = None
                     try:
                         res_json = sr.json()
                         err_code = res_json.get("errno")
                     except Exception:
                         pass
-                    
-                    if err_code == 130:
-                        file_res["error"] = "transcoding_in_progress"
-                        if wait_for_transcoding:
-                            time.sleep(retry_delay)
-                        else:
-                            break
-                    else:
-                        file_res["error"] = f"Streaming API failed: {sr.text[:200]}"
-                        break
+                    return False, err_code, sr.text[:200]
                 except Exception as e:
-                    file_res["error"] = f"Streaming request exception: {e}"
+                    return False, -1, str(e)
+            
+            # PASS 1: Quick scan — try each resolution once to find any that's ready
+            best_m3u8 = None
+            all_transcoding = True
+            fatal_error = None
+            
+            for stype in stream_types:
+                ok, errno, text = _try_stream(stype)
+                if ok:
+                    best_m3u8 = (stype, text)
+                    all_transcoding = False
                     break
+                elif errno == 130:
+                    # Transcoding in progress — try next (lower) resolution
+                    continue
+                elif errno in (31066,):
+                    # File format not supported for streaming at all
+                    fatal_error = f"File format not supported for streaming (errno {errno})"
+                    all_transcoding = False
+                    break
+                elif errno in (31341, 31023):
+                    fatal_error = f"File path error or not found (errno {errno})"
+                    all_transcoding = False
+                    break
+                else:
+                    # Unknown error on this type, try next
+                    all_transcoding = False
+                    file_res["error"] = f"Streaming API errno {errno}: {text}"
+                    continue
+            
+            if best_m3u8:
+                file_res["stream_ready"] = True
+                file_res["stream_m3u8"] = best_m3u8[1]
+                file_res["error"] = None
+            elif fatal_error:
+                file_res["error"] = fatal_error
+            elif all_transcoding and wait_for_transcoding:
+                # PASS 2: All resolutions are still transcoding — wait and retry
+                max_retries = 12
+                retry_delay = 10
+                print(f"  ⏳ All resolutions still transcoding, waiting (up to {max_retries * retry_delay}s)...")
+                for attempt in range(1, max_retries + 1):
+                    time.sleep(retry_delay)
+                    # Retry all types each round (highest first)
+                    for stype in stream_types:
+                        ok, errno, text = _try_stream(stype)
+                        if ok:
+                            file_res["stream_ready"] = True
+                            file_res["stream_m3u8"] = text
+                            file_res["error"] = None
+                            break
+                    if file_res["stream_ready"]:
+                        break
+                if not file_res["stream_ready"]:
+                    file_res["error"] = "transcoding_in_progress"
+            elif all_transcoding:
+                file_res["error"] = "transcoding_in_progress"
         
         # --- ACTION DOWNLOAD (or fallback when stream not ready) ---
         if action == "d" or (action == "s" and not file_res["stream_ready"]):
