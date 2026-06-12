@@ -3,6 +3,7 @@ import os
 import time
 import threading
 import hashlib
+import hmac
 import json
 from collections import OrderedDict
 from flask import Flask, request, jsonify, Response
@@ -201,6 +202,19 @@ def check_auth():
     return client_key in (expected_key, "supercloudkey")
 
 
+# ─── HMAC Signature Helpers for URL Security ──────────────────────────
+def generate_signature(param1, param2, param3=""):
+    secret = API_KEY or "supercloudkey"
+    message = f"{param1}|{param2}|{param3}"
+    return hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+
+def verify_signature(param1, param2, param3, signature):
+    if not signature:
+        return False
+    expected = generate_signature(param1, param2, param3)
+    return hmac.compare_digest(expected, signature)
+
+
 
 
 # ─── Startup timestamp ──────────────────────────────────────────────
@@ -326,20 +340,20 @@ def resolve():
                 for k, v in raw_thumbs.items():
                     if v:
                         if original_fs_id and surl:
-                            proxy_url = f"{request.scheme}://{request.host}/api/thumbnail?surl={surl}&fs_id={original_fs_id}&size_type={k}"
+                            sig = generate_signature(surl, original_fs_id, k)
+                            proxy_url = f"{request.scheme}://{request.host}/api/thumbnail?surl={surl}&fs_id={original_fs_id}&size_type={k}&sig={sig}"
                         else:
                             quoted_v = urllib.parse.quote(v)
                             proxy_url = f"{request.scheme}://{request.host}/api/thumbnail?url={quoted_v}"
-                        if API_KEY:
-                            proxy_url += f"&key={API_KEY}"
+                            if API_KEY:
+                                proxy_url += f"&key={API_KEY}"
                         proxied_thumbs[k] = proxy_url
 
             # Shortened download proxy link
             dlink_url = f.get("dlink")
             if dlink_url and original_fs_id and surl:
-                proxy_dlink = f"{request.scheme}://{request.host}/api/download?surl={surl}&fs_id={original_fs_id}"
-                if API_KEY:
-                    proxy_dlink += f"&key={API_KEY}"
+                sig = generate_signature(surl, original_fs_id, "")
+                proxy_dlink = f"{request.scheme}://{request.host}/api/download?surl={surl}&fs_id={original_fs_id}&sig={sig}"
             else:
                 proxy_dlink = dlink_url
 
@@ -459,9 +473,8 @@ def stream_manifest():
             line_stripped = line.strip()
             if line_stripped and not line_stripped.startswith("#"):
                 quoted_url = urllib.parse.quote(line_stripped)
-                proxy_url = f"{request.scheme}://{request.host}/api/stream/segment?url={quoted_url}"
-                if API_KEY:
-                    proxy_url += f"&key={API_KEY}"
+                sig = generate_signature(line_stripped, "", "")
+                proxy_url = f"{request.scheme}://{request.host}/api/stream/segment?url={quoted_url}&sig={sig}"
                 proxied_lines.append(proxy_url)
             else:
                 proxied_lines.append(line)
@@ -488,14 +501,16 @@ def stream_segment():
         resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
         return resp
 
-    if not check_auth():
-        return "Unauthorized: Invalid or missing API key.", 401
-
     url = request.args.get("url") or ""
+    sig = request.args.get("sig") or ""
     if not url:
         return "Missing segment URL", 400
 
     target_url = urllib.parse.unquote(url)
+
+    # Authorize either via master key OR via valid signature
+    if not check_auth() and not verify_signature(target_url, "", "", sig):
+        return "Unauthorized: Invalid signature or API key.", 401
 
     # SSRF Protection
     try:
@@ -560,16 +575,22 @@ def stream_thumbnail():
         resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
         return resp
 
-    if not check_auth():
-        return "Unauthorized: Invalid or missing API key.", 401
-
     url = request.args.get("url") or ""
     surl = request.args.get("surl") or ""
     fs_id = request.args.get("fs_id") or ""
     size_type = request.args.get("size_type") or request.args.get("size") or "url3"
+    sig = request.args.get("sig") or ""
 
     if not url and not (surl and fs_id):
         return "Missing thumbnail URL or surl/fs_id parameters", 400
+
+    # Authorize either via master key OR via valid signature
+    if not url:
+        if not check_auth() and not verify_signature(surl, fs_id, size_type, sig):
+            return "Unauthorized: Invalid signature or API key.", 401
+    else:
+        if not check_auth():
+            return "Unauthorized: Invalid API key.", 401
 
     target_url = ""
     if url:
@@ -662,14 +683,16 @@ def download_file_route():
         resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
         return resp
 
-    if not check_auth():
-        return "Unauthorized: Invalid or missing API key.", 401
-
     surl = request.args.get("surl") or ""
     fs_id = request.args.get("fs_id") or ""
+    sig = request.args.get("sig") or ""
 
     if not surl or not fs_id:
         return "Missing required parameters: surl and fs_id", 400
+
+    # Authorize either via master key OR via valid signature
+    if not check_auth() and not verify_signature(surl, fs_id, "", sig):
+        return "Unauthorized: Invalid signature or API key.", 401
 
     share_url = f"https://1024terabox.com/s/{surl}"
     cached_res = cache.get(share_url, "d", False)
