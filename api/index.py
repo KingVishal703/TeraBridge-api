@@ -14,8 +14,18 @@ def home():
     return jsonify({
         "status": "online",
         "message": "TeraBridge API is running!",
+        "version": "1.1.0",
         "endpoints": {
-            "/api/resolve": "GET or POST to resolve share links"
+            "/api/resolve": {
+                "method": "GET or POST",
+                "description": "Resolves Terabox share links into metadata, direct download links, or streaming playlists.",
+                "parameters": {
+                    "url / link": "Required. The Terabox shared URL or shorturl token.",
+                    "mode / action": "Optional. Action to perform: 'download' (default, generates direct download links), 'stream' (generates HLS M3U8 playlists), or 'list' (extremely fast, gets file info/metadata without copy or download).",
+                    "wait": "Optional. Boolean (true/1/True). If true, waits/retries for transcoding when resolving streaming playlists."
+                },
+                "example_usage": "/api/resolve?url=https://terasharefile.com/s/11HTXTPgKapRLE3cTXSFMJQ&action=list"
+            }
         }
     })
 
