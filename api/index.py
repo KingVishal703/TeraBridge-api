@@ -705,6 +705,9 @@ def stream_segment():
             ".baidu.com",
             ".terabox.com",
             ".teraboxapp.com",
+            ".1024terabox.com-videotran-hybcloud",
+            ".terabox.com-videotran-hybcloud",
+            ".teraboxapp.com-videotran-hybcloud",
             ".koofr.net",        # TeraBox HLS segment / manifest CDN
             ".koofr.eu",
             "pcs.baidu.com",
