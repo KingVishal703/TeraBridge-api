@@ -67,6 +67,26 @@ def update_credentials(cookie=None, js_token=None, bds_token=None, sign=None, ti
     if logid:
         LOGID = logid
 
+def validate_session_cookie(cookie_str):
+    """Verify if a TeraBox cookie is valid by making a test request and checking for a bdstoken."""
+    temp_session = requests.Session()
+    temp_session.headers.update(HEADERS)
+    temp_cookies = parse_cookies(cookie_str)
+    temp_session.cookies.update(temp_cookies)
+    
+    try:
+        r = temp_session.get(f"{BASE_API}/main", timeout=15)
+        if r.status_code != 200:
+            return False, f"HTTP status {r.status_code}"
+        
+        # Look for bdstoken in the response HTML to verify successful session
+        m = re.findall(r'bdstoken["\']?\s*[:=]\s*["\']([a-f0-9]{32})["\']', r.text, re.IGNORECASE)
+        if m:
+            return True, "Valid"
+        return False, "bdstoken not found (session likely expired or invalid)"
+    except Exception as e:
+        return False, f"Request failed: {str(e)}"
+
 COOKIES_DICT = parse_cookies(COOKIE)
 
 HEADERS = {

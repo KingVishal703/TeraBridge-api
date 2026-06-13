@@ -21,7 +21,7 @@ except ImportError:
 # Add the project root directory to sys.path to resolve downloader module
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from downloader import resolve_link, session, parse_surl, UA, COOKIES_DICT
+from downloader import resolve_link, session, parse_surl, UA, COOKIES_DICT, validate_session_cookie
 from api.redis_client import redis_client
 
 app = Flask(__name__)
@@ -54,6 +54,8 @@ API_KEY           = os.environ.get("API_KEY")                    # API Key for s
 HMAC_SECRET       = os.environ.get("HMAC_SECRET") or API_KEY        # HMAC secret (falls back to API_KEY if not set; required if API_KEY is set)
 REQUIRE_API_KEY   = os.environ.get("REQUIRE_API_KEY", "auto").lower() not in ("0", "false", "no")
 TRUSTED_PROXY_CIDRS_RAW = os.environ.get("TRUSTED_PROXIES", "").strip()
+CRON_SECRET             = os.environ.get("CRON_SECRET")
+NOTIFICATION_WEBHOOK_URL = os.environ.get("NOTIFICATION_WEBHOOK_URL")
 
 def _parse_trusted_cidrs(raw):
     """Parse a comma-separated CIDR list. Empty entries are ignored."""
@@ -528,10 +530,25 @@ def stats():
         return jsonify({"status": "error", "message": "Unauthorized: Invalid or missing API key."}), 401
     uptime = int(time.time() - _start_time)
     redis_status = "connected" if redis_client else "disabled"
+    
+    session_health = {"status": "unknown", "last_checked_timestamp": None, "message": "No validation check run yet."}
+    if redis_client:
+        try:
+            status_data = redis_client.hgetall("terabridge:status")
+            if status_data:
+                session_health = {
+                    "status": "healthy" if status_data.get("cookie_valid") == "true" else "unhealthy",
+                    "last_checked_timestamp": status_data.get("last_checked"),
+                    "message": status_data.get("message")
+                }
+        except Exception:
+            pass
+
     return jsonify({
         "status": "online",
         "uptime_seconds": uptime,
         "redis": redis_status,
+        "session_health": session_health,
         "cache": cache.stats(),
         "rate_limiter": rate_limiter.stats(),
     })
@@ -1227,6 +1244,108 @@ def admin_config():
                 "status": "error",
                 "message": f"Failed to read config from Redis: {str(e)}"
             }), 500
+
+
+# ─── Cron Session Validation & Webhook Alerts ───────────────────────
+
+def send_webhook_alert(message):
+    """Send an embed alert message to Discord or text alert to Slack."""
+    if not NOTIFICATION_WEBHOOK_URL:
+        return
+    import datetime
+    import requests
+    
+    payload = {}
+    if "discord.com" in NOTIFICATION_WEBHOOK_URL:
+        payload = {
+            "embeds": [{
+                "title": "🚨 TeraBridge API Warning",
+                "description": message,
+                "color": 16711680, # Red
+                "timestamp": datetime.datetime.utcnow().isoformat()
+            }]
+        }
+    elif "slack.com" in NOTIFICATION_WEBHOOK_URL:
+        payload = {
+            "text": f"🚨 *TeraBridge API Warning:*\n{message}"
+        }
+    else:
+        # Generic webhook structure
+        payload = {
+            "event": "session_expired",
+            "message": message
+        }
+
+    try:
+        requests.post(NOTIFICATION_WEBHOOK_URL, json=payload, timeout=10)
+    except Exception as e:
+        print(f"[TeraBridge][WARN] Failed to send webhook alert: {e}", flush=True)
+
+
+@app.route("/api/cron/validate", methods=["GET", "POST", "OPTIONS"])
+def cron_validate():
+    if request.method == "OPTIONS":
+        resp = Response()
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        return resp
+
+    # Validate secret parameter to prevent spam
+    client_secret = request.args.get("secret") or (request.get_json(silent=True) or {}).get("secret")
+    if CRON_SECRET and client_secret != CRON_SECRET:
+        return jsonify({"status": "error", "message": "Unauthorized: Invalid or missing cron secret."}), 401
+
+    # Load active cookie from Redis or fall back to environment variable
+    active_cookie = None
+    from downloader import COOKIE
+    if redis_client:
+        try:
+            creds = redis_client.hgetall("terabridge:config") or {}
+            active_cookie = creds.get("cookie")
+        except Exception as e:
+            print(f"[TeraBridge][WARN] Failed to fetch cookie from Redis in cron: {e}", flush=True)
+    
+    if not active_cookie:
+        active_cookie = COOKIE
+
+    if not active_cookie:
+        return jsonify({"status": "error", "message": "No active cookie found to validate."}), 400
+
+    # Call validate_session_cookie helper
+    is_valid, msg = validate_session_cookie(active_cookie)
+    
+    # Update state in Redis
+    status_data = {
+        "cookie_valid": "true" if is_valid else "false",
+        "last_checked": str(int(time.time())),
+        "message": msg
+    }
+    
+    if redis_client:
+        try:
+            redis_client.hset("terabridge:status", values=status_data)
+        except Exception as e:
+            print(f"[TeraBridge][WARN] Failed to write status to Redis in cron: {e}", flush=True)
+
+    if not is_valid:
+        # Trigger webhook alert
+        alert_msg = (
+            f"Your TeraBox cookies have expired or are invalid!\n"
+            f"**Error/Reason:** `{msg}`\n\n"
+            f"Please refresh your cookies and update them at the dynamic configuration endpoint `/api/admin/config` immediately."
+        )
+        send_webhook_alert(alert_msg)
+        return jsonify({
+            "status": "unhealthy",
+            "message": "Session cookies are expired or invalid. Webhook notification triggered.",
+            "error": msg
+        }), 200
+
+    return jsonify({
+        "status": "healthy",
+        "message": "Session cookies are valid."
+    }), 200
 
 
 # ─── Server Entry Point ─────────────────────────────────────────────
