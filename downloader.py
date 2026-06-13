@@ -47,6 +47,26 @@ def parse_cookies(cookie_str):
             cookies[k.strip()] = v.strip()
     return cookies
 
+def update_credentials(cookie=None, js_token=None, bds_token=None, sign=None, timestamp=None, logid=None):
+    """Dynamically update Terabox global cookies and tokens in the session."""
+    global COOKIE, COOKIES_DICT, JSTOKEN, BDSTOKEN, SIGN, TIMESTAMP, LOGID, session
+    if cookie:
+        COOKIE = cookie
+        COOKIES_DICT = parse_cookies(cookie)
+        # Clear existing cookies in session and update with new ones
+        session.cookies.clear()
+        session.cookies.update(COOKIES_DICT)
+    if js_token:
+        JSTOKEN = js_token
+    if bds_token:
+        BDSTOKEN = bds_token
+    if sign:
+        SIGN = sign
+    if timestamp:
+        TIMESTAMP = timestamp
+    if logid:
+        LOGID = logid
+
 COOKIES_DICT = parse_cookies(COOKIE)
 
 HEADERS = {

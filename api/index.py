@@ -22,6 +22,7 @@ except ImportError:
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from downloader import resolve_link, session, parse_surl, UA, COOKIES_DICT
+from api.redis_client import redis_client
 
 app = Flask(__name__)
 
@@ -187,9 +188,10 @@ def _request_base_url():
 
 # ─── Thread-safe LRU Cache ──────────────────────────────────────────
 class ResponseCache:
-    """Thread-safe in-memory LRU cache with TTL expiry."""
+    """Thread-safe cache that uses Upstash Redis (if configured) or falls back to in-memory LRU."""
 
-    def __init__(self, max_entries=256, ttl_seconds=60):
+    def __init__(self, max_entries=256, ttl_seconds=60, redis_client=None):
+        self.redis_client = redis_client
         self._store = OrderedDict()   # key -> (response_dict, timestamp)
         self._lock = threading.Lock()
         self._max = max_entries
@@ -203,6 +205,27 @@ class ResponseCache:
 
     def get(self, link, action, wait):
         key = self._make_key(link, action, wait)
+        if self.redis_client:
+            try:
+                redis_key = f"cache:response:{key}"
+                data_str = self.redis_client.get(redis_key)
+                if data_str:
+                    self.hits += 1
+                    try:
+                        self.redis_client.incr("stats:cache_hits")
+                    except Exception:
+                        pass
+                    return json.loads(data_str)
+                else:
+                    self.misses += 1
+                    try:
+                        self.redis_client.incr("stats:cache_misses")
+                    except Exception:
+                        pass
+                    return None
+            except Exception as e:
+                print(f"[TeraBridge][WARN] Upstash Redis get error: {e}", flush=True)
+
         with self._lock:
             if key in self._store:
                 data, ts = self._store[key]
@@ -217,18 +240,48 @@ class ResponseCache:
 
     def put(self, link, action, wait, response):
         key = self._make_key(link, action, wait)
+        if self.redis_client:
+            try:
+                redis_key = f"cache:response:{key}"
+                self.redis_client.set(redis_key, json.dumps(response), ex=self._ttl)
+                return
+            except Exception as e:
+                print(f"[TeraBridge][WARN] Upstash Redis put error: {e}", flush=True)
+
         with self._lock:
             if key in self._store:
                 del self._store[key]
             self._store[key] = (response, time.time())
-            # LRU eviction
             while len(self._store) > self._max:
                 self._store.popitem(last=False)
 
     def stats(self):
+        if self.redis_client:
+            try:
+                redis_hits = int(self.redis_client.get("stats:cache_hits") or 0)
+                redis_misses = int(self.redis_client.get("stats:cache_misses") or 0)
+                total = redis_hits + redis_misses
+                
+                try:
+                    entries_count = len(self.redis_client.keys("cache:response:*") or [])
+                except Exception:
+                    entries_count = "unknown"
+                
+                return {
+                    "provider": "upstash-redis",
+                    "entries": entries_count,
+                    "ttl_seconds": self._ttl,
+                    "hits": redis_hits,
+                    "misses": redis_misses,
+                    "hit_rate": f"{(redis_hits / total * 100):.1f}%" if total > 0 else "N/A",
+                }
+            except Exception as e:
+                print(f"[TeraBridge][WARN] Upstash Redis stats error: {e}", flush=True)
+        
         with self._lock:
             total = self.hits + self.misses
             return {
+                "provider": "in-memory",
                 "entries": len(self._store),
                 "max_entries": self._max,
                 "ttl_seconds": self._ttl,
@@ -237,13 +290,14 @@ class ResponseCache:
                 "hit_rate": f"{(self.hits / total * 100):.1f}%" if total > 0 else "N/A",
             }
 
-cache = ResponseCache(max_entries=CACHE_MAX_ENTRIES, ttl_seconds=CACHE_TTL_SECONDS)
+cache = ResponseCache(max_entries=CACHE_MAX_ENTRIES, ttl_seconds=CACHE_TTL_SECONDS, redis_client=redis_client)
 
 # ─── Sliding-Window Rate Limiter ─────────────────────────────────────
 class RateLimiter:
-    """Per-IP sliding window rate limiter."""
+    """Per-IP sliding window rate limiter that utilizes Upstash Redis (if configured)."""
 
-    def __init__(self, max_requests=30, window_seconds=60):
+    def __init__(self, max_requests=30, window_seconds=60, redis_client=None):
+        self.redis_client = redis_client
         self._requests = {}   # ip -> list of timestamps
         self._lock = threading.Lock()
         self._max = max_requests
@@ -252,11 +306,31 @@ class RateLimiter:
 
     def is_allowed(self, ip):
         now = time.time()
+        if self.redis_client:
+            try:
+                key = f"rate_limit:{ip}"
+                pipeline = self.redis_client.pipeline()
+                pipeline.zremrangebyscore(key, 0, now - self._window)
+                pipeline.zadd(key, {str(now): now})
+                pipeline.zcard(key)
+                pipeline.expire(key, self._window)
+                res = pipeline.exec()
+                
+                count = int(res[2])
+                if count > self._max:
+                    try:
+                        self.redis_client.incr("stats:rate_limit_blocked")
+                    except Exception:
+                        pass
+                    return False
+                return True
+            except Exception as e:
+                print(f"[TeraBridge][WARN] Upstash Redis rate limit check error: {e}", flush=True)
+
         with self._lock:
             if ip not in self._requests:
                 self._requests[ip] = []
 
-            # Trim timestamps outside the window
             self._requests[ip] = [
                 ts for ts in self._requests[ip] if now - ts < self._window
             ]
@@ -270,6 +344,18 @@ class RateLimiter:
 
     def remaining(self, ip):
         now = time.time()
+        if self.redis_client:
+            try:
+                key = f"rate_limit:{ip}"
+                pipeline = self.redis_client.pipeline()
+                pipeline.zremrangebyscore(key, 0, now - self._window)
+                pipeline.zcard(key)
+                res = pipeline.exec()
+                count = int(res[1])
+                return max(0, self._max - count)
+            except Exception as e:
+                print(f"[TeraBridge][WARN] Upstash Redis rate limit remaining error: {e}", flush=True)
+
         with self._lock:
             if ip not in self._requests:
                 return self._max
@@ -277,6 +363,24 @@ class RateLimiter:
             return max(0, self._max - len(active))
 
     def stats(self):
+        if self.redis_client:
+            try:
+                blocked = int(self.redis_client.get("stats:rate_limit_blocked") or 0)
+                try:
+                    active_keys = self.redis_client.keys("rate_limit:*") or []
+                    active_clients = len(active_keys)
+                except Exception:
+                    active_clients = "unknown"
+                return {
+                    "provider": "upstash-redis",
+                    "max_rpm": self._max,
+                    "window_seconds": self._window,
+                    "active_clients": active_clients,
+                    "total_blocked": blocked,
+                }
+            except Exception as e:
+                print(f"[TeraBridge][WARN] Upstash Redis rate limit stats error: {e}", flush=True)
+
         now = time.time()
         with self._lock:
             active_ips = sum(
@@ -284,6 +388,7 @@ class RateLimiter:
                 if any(now - ts < self._window for ts in ts_list)
             )
             return {
+                "provider": "in-memory",
                 "max_rpm": self._max,
                 "window_seconds": self._window,
                 "active_clients": active_ips,
@@ -291,7 +396,9 @@ class RateLimiter:
             }
 
     def cleanup(self):
-        """Periodically remove stale IPs to prevent memory growth."""
+        """Periodically remove stale IPs to prevent memory growth (only for in-memory)."""
+        if self.redis_client:
+            return
         now = time.time()
         with self._lock:
             stale = [
@@ -301,7 +408,7 @@ class RateLimiter:
             for ip in stale:
                 del self._requests[ip]
 
-rate_limiter = RateLimiter(max_requests=RATE_LIMIT_RPM, window_seconds=RATE_LIMIT_WINDOW)
+rate_limiter = RateLimiter(max_requests=RATE_LIMIT_RPM, window_seconds=RATE_LIMIT_WINDOW, redis_client=redis_client)
 
 # Background cleanup every 5 minutes to prevent stale IP accumulation
 def _periodic_cleanup():
@@ -420,9 +527,11 @@ def stats():
     if not check_auth():
         return jsonify({"status": "error", "message": "Unauthorized: Invalid or missing API key."}), 401
     uptime = int(time.time() - _start_time)
+    redis_status = "connected" if redis_client else "disabled"
     return jsonify({
         "status": "online",
         "uptime_seconds": uptime,
+        "redis": redis_status,
         "cache": cache.stats(),
         "rate_limiter": rate_limiter.stats(),
     })
@@ -569,7 +678,8 @@ def resolve():
     except Exception as e:
         import traceback
         import sys
-        traceback.print_exc(file=sys.stdout)
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
         return jsonify({
             "status": "error",
             "message": f"Server encountered exception: {str(e)}"
@@ -989,6 +1099,134 @@ def download_file_route():
 
     except Exception as e:
         return f"Download proxy encountered an error: {str(e)}", 500
+
+
+# ─── Dynamic Config Sync ─────────────────────────────────────────────
+_last_config_check = 0
+CONFIG_CHECK_INTERVAL = 60 # seconds
+
+def load_config_from_redis():
+    """Load latest configuration/cookies from Upstash Redis and update downloader globals."""
+    if not redis_client:
+        return
+    try:
+        # Fetch config hash from redis
+        creds = redis_client.hgetall("terabridge:config")
+        if creds:
+            from downloader import update_credentials
+            update_credentials(
+                cookie=creds.get("cookie"),
+                js_token=creds.get("js_token"),
+                bds_token=creds.get("bds_token"),
+                sign=creds.get("sign"),
+                timestamp=creds.get("timestamp"),
+                logid=creds.get("logid")
+            )
+            print("[TeraBridge] Successfully synchronized credentials from Upstash Redis", flush=True)
+    except Exception as e:
+        print(f"[TeraBridge][WARN] Failed to load config from Upstash Redis: {e}", flush=True)
+
+@app.before_request
+def check_config_refresh():
+    if request.method == "OPTIONS":
+        return
+    global _last_config_check
+    now = time.time()
+    if now - _last_config_check > CONFIG_CHECK_INTERVAL:
+        load_config_from_redis()
+        _last_config_check = now
+
+# Load initial config from Redis on import / startup
+load_config_from_redis()
+
+
+# ─── Admin Config Routes ─────────────────────────────────────────────
+
+@app.route("/api/admin/config", methods=["GET", "POST", "OPTIONS"])
+def admin_config():
+    if request.method == "OPTIONS":
+        resp = Response()
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        return resp
+
+    if not check_auth():
+        return jsonify({"status": "error", "message": "Unauthorized: Invalid or missing API key."}), 401
+
+    if not redis_client:
+        return jsonify({
+            "status": "error",
+            "message": "Redis client is not configured. Config cannot be updated dynamically."
+        }), 400
+
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        
+        valid_keys = {"cookie", "js_token", "bds_token", "sign", "timestamp", "logid"}
+        updates = {k: v for k, v in data.items() if k in valid_keys and v is not None}
+        
+        if not updates:
+            return jsonify({
+                "status": "error",
+                "message": "No valid configuration updates provided."
+            }), 400
+
+        try:
+            redis_client.hset("terabridge:config", values=updates)
+            
+            # Immediately update memory state of current process
+            from downloader import update_credentials
+            update_credentials(
+                cookie=updates.get("cookie"),
+                js_token=updates.get("js_token"),
+                bds_token=updates.get("bds_token"),
+                sign=updates.get("sign"),
+                timestamp=updates.get("timestamp"),
+                logid=updates.get("logid")
+            )
+            
+            # Reset stale check timer to delay next Redis fetch
+            global _last_config_check
+            _last_config_check = time.time()
+            
+            return jsonify({
+                "status": "success",
+                "message": "Configuration updated successfully in Redis and applied locally.",
+                "updated_keys": list(updates.keys())
+            })
+        except Exception as e:
+            return jsonify({
+                "status": "error",
+                "message": f"Failed to update config in Redis: {str(e)}"
+            }), 500
+
+    else:
+        # GET request: fetch from Redis and mask sensitive values
+        try:
+            creds = redis_client.hgetall("terabridge:config") or {}
+            
+            def mask_val(key, val):
+                if not val:
+                    return None
+                if key == "cookie":
+                    if len(val) > 30:
+                        return f"{val[:15]}...{val[-15:]}"
+                    return "set"
+                if len(val) > 8:
+                    return f"{val[:4]}...{val[-4:]}"
+                return "set"
+
+            masked = {k: mask_val(k, v) for k, v in creds.items()}
+            return jsonify({
+                "status": "success",
+                "config": masked
+            })
+        except Exception as e:
+            return jsonify({
+                "status": "error",
+                "message": f"Failed to read config from Redis: {str(e)}"
+            }), 500
 
 
 # ─── Server Entry Point ─────────────────────────────────────────────
