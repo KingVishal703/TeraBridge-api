@@ -832,13 +832,46 @@ def stream_segment():
         # An entry that starts with "." is a domain-suffix match; an entry
         # without a leading dot is matched exactly (e.g. "pcs.baidu.com").
         allowed_suffixes = (
+            # Core/Official
             ".1024terabox.com",
-            ".baidu.com",
             ".terabox.com",
             ".teraboxapp.com",
+            ".terabox.app",
+            ".baidu.com",
+            
+            # Common Mirrors/Rebrands
+            ".freeterabox.com",
+            ".nephobox.com",
+            ".momerybox.com",
+            ".mirrobox.com",
+            ".gibibox.com",
+            ".tibibox.com",
+            ".4funbox.com",
+            ".1024tera.com",
+            ".1024nephobox.com",
+            ".terabox.fun",
+            ".terasharefile.com",
+            ".teraboxlink.com",
+
+            # HLS Videotran CDN variants
             ".1024terabox.com-videotran-hybcloud",
             ".terabox.com-videotran-hybcloud",
             ".teraboxapp.com-videotran-hybcloud",
+            ".terabox.app-videotran-hybcloud",
+            ".freeterabox.com-videotran-hybcloud",
+            ".nephobox.com-videotran-hybcloud",
+            ".momerybox.com-videotran-hybcloud",
+            ".mirrobox.com-videotran-hybcloud",
+            ".gibibox.com-videotran-hybcloud",
+            ".tibibox.com-videotran-hybcloud",
+            ".4funbox.com-videotran-hybcloud",
+            ".1024tera.com-videotran-hybcloud",
+            ".1024nephobox.com-videotran-hybcloud",
+            ".terabox.fun-videotran-hybcloud",
+            ".terasharefile.com-videotran-hybcloud",
+            ".teraboxlink.com-videotran-hybcloud",
+            
+            # Other CDNs/Redirects
             ".koofr.net",        # TeraBox HLS segment / manifest CDN
             ".koofr.eu",
             "pcs.baidu.com",
@@ -961,10 +994,28 @@ def stream_thumbnail():
         parsed = urllib.parse.urlparse(target_url)
         domain = parsed.netloc.lower()
         allowed_suffixes = (
+            # Core/Official
             ".1024terabox.com",
-            ".baidu.com",
             ".terabox.com",
             ".teraboxapp.com",
+            ".terabox.app",
+            ".baidu.com",
+            
+            # Mirrors/Rebrands
+            ".freeterabox.com",
+            ".nephobox.com",
+            ".momerybox.com",
+            ".mirrobox.com",
+            ".gibibox.com",
+            ".tibibox.com",
+            ".4funbox.com",
+            ".1024tera.com",
+            ".1024nephobox.com",
+            ".terabox.fun",
+            ".terasharefile.com",
+            ".teraboxlink.com",
+
+            # Other CDN and storage servers
             "pcs.baidu.com",
             "d.pcs.1024terabox.com",
             "dm-data.terabox.com"
