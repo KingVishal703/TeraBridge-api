@@ -201,7 +201,7 @@ def parse_surl(url):
     # from collapsing to a single character.
     if len(surl) > 22 and surl.startswith("1"):
         for _ in range(_LEADING_ONE_MAX_STRIPS):
-            if not surl.startswith("1") or len(surl) - 1 < _SURL_MIN_LEN:
+            if not surl.startswith("1") or len(surl) - 1 < _SURL_MIN_LEN or len(surl) <= 22:
                 break
             surl = surl[1:]
 
