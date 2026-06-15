@@ -456,6 +456,7 @@ def verify_firebase_token(token):
     if not token:
         return False
     try:
+        request.firebase_token = token
         public_keys = get_google_public_keys()
         unverified_header = jwt.get_unverified_header(token)
         kid = unverified_header.get("kid")
@@ -509,6 +510,8 @@ def check_auth():
       3. ?key=...  or  ?api_key=...  query parameter
       4. JSON body {"key": ...} or {"api_key": ...}
     """
+    request.auth_type = None
+
     # 1. Custom header
     client_key = request.headers.get("X-API-Key")
 
@@ -520,6 +523,7 @@ def check_auth():
             # If the token contains dots, check if it's a valid Firebase JWT
             if bearer_token.count(".") == 2:
                 if verify_firebase_token(bearer_token):
+                    request.auth_type = "firebase"
                     return True
             else:
                 client_key = bearer_token
@@ -540,21 +544,192 @@ def check_auth():
         if not API_KEY:
             if REQUIRE_API_KEY:
                 return False
+            request.auth_type = "anonymous"
             return True
         return False
 
     # Check against static API key
     if API_KEY and hmac.compare_digest(client_key, API_KEY):
+        request.auth_type = "admin"
         return True
 
     return False
 
 
+def check_admin():
+    """
+    Strict authorization for administrative endpoints (config, stats).
+
+    Unlike check_auth(), this ONLY accepts the static master API_KEY. A valid
+    Firebase user JWT is deliberately NOT sufficient — any signed-up app user
+    can mint one, so trusting it here would let any user read/overwrite the
+    TeraBox account pool. Admin access must use the out-of-band master key.
+
+    Accepted transports: X-API-Key header, Authorization: Bearer <key>
+    (non-JWT), ?key=/?api_key= query param, or JSON body {"key"/"api_key"}.
+    """
+    if not API_KEY:
+        # No master key configured → no one is an admin. Fail closed.
+        return False
+
+    client_key = request.headers.get("X-API-Key")
+
+    if not client_key:
+        auth_header = request.headers.get("Authorization") or ""
+        if auth_header.startswith("Bearer "):
+            bearer_token = auth_header[len("Bearer "):].strip()
+            # Reject Firebase JWTs (they have two dots); only a raw key counts.
+            if bearer_token.count(".") != 2:
+                client_key = bearer_token
+
+    if not client_key:
+        client_key = request.args.get("key") or request.args.get("api_key")
+
+    if not client_key and request.is_json:
+        try:
+            client_key = request.json.get("key") or request.json.get("api_key")
+        except Exception:
+            pass
+
+    if not client_key:
+        return False
+
+    return hmac.compare_digest(client_key, API_KEY)
+
+
 
 # ─── HMAC Signature Helpers for URL Security ──────────────────────────
-def generate_signature(param1, param2, param3=""):
+
+# Tiered per-purpose signed-URL lifetimes (seconds). Segment/download URLs are
+# bandwidth-heavy and consumed immediately, so they expire fast. Manifest and
+# thumbnail URLs are persisted long-term in the client library/discover feed,
+# so they get a long window to avoid breaking saved videos.
+TIERED_SIGNATURE_TTLS = {
+    "free": {
+        "segment":   int(os.environ.get("SIG_TTL_SEGMENT_FREE",   30 * 60)),        # 30m
+        "download":  int(os.environ.get("SIG_TTL_DOWNLOAD_FREE",  2 * 3600)),       # 2h
+        "manifest":  int(os.environ.get("SIG_TTL_MANIFEST_FREE",  24 * 3600)),      # 24h
+        "thumbnail": int(os.environ.get("SIG_TTL_THUMBNAIL_FREE", 24 * 3600)),      # 24h
+    },
+    "premium": {
+        "segment":   int(os.environ.get("SIG_TTL_SEGMENT_PREMIUM",   2 * 3600)),       # 2h
+        "download":  int(os.environ.get("SIG_TTL_DOWNLOAD_PREMIUM",  24 * 3600)),      # 24h
+        "manifest":  int(os.environ.get("SIG_TTL_MANIFEST_PREMIUM",  30 * 24 * 3600)), # 30d
+        "thumbnail": int(os.environ.get("SIG_TTL_THUMBNAIL_PREMIUM", 30 * 24 * 3600)), # 30d
+    }
+}
+DEFAULT_SIGNATURE_TTL = int(os.environ.get("SIG_TTL_DEFAULT", 24 * 3600))
+
+_user_tier_cache = {}
+_user_tier_cache_lock = threading.Lock()
+USER_TIER_CACHE_TTL = 300  # Cache user tier in-memory for 5 minutes
+
+
+def get_user_tier():
     """
-    HMAC-SHA256 signature over `param1|param2|param3` using HMAC_SECRET.
+    Determine the user's tier ('premium' or 'free') from request context.
+    Checks request.auth_type. If 'admin', returns 'premium'.
+    Checks request.user for a custom claim 'tier'.
+    If not found, queries Firebase Realtime DB using the user's uid and JWT token.
+    Falls back to 'free' if unauthorized/anonymous.
+    """
+    try:
+        # Check if we are outside of a Flask request context (e.g. background threads)
+        if not request:
+            return "free"
+    except RuntimeError:
+        return "free"
+
+    auth_type = getattr(request, "auth_type", None)
+    if auth_type == "admin":
+        return "premium"
+
+    user = getattr(request, "user", None)
+    if not user:
+        return "free"
+
+    # Check custom claims in JWT
+    tier = user.get("tier") or user.get("role")
+    if tier:
+        tier_str = str(tier).lower()
+        if "premium" in tier_str or "pro" in tier_str:
+            return "premium"
+        return "free"
+
+    # Otherwise, check cache or query Firebase Realtime DB
+    uid = user.get("user_id") or user.get("sub")
+    if not uid:
+        return "free"
+
+    now = time.time()
+    # 1. Check in-memory cache
+    with _user_tier_cache_lock:
+        if uid in _user_tier_cache:
+            cached_tier, expiry = _user_tier_cache[uid]
+            if now < expiry:
+                return cached_tier
+
+    # 2. Check Redis cache if available
+    if redis_client:
+        try:
+            redis_key = f"user:tier:{uid}"
+            cached_tier = redis_client.get(redis_key)
+            if cached_tier:
+                if isinstance(cached_tier, bytes):
+                    cached_tier = cached_tier.decode('utf-8')
+                # Save to local memory cache
+                with _user_tier_cache_lock:
+                    _user_tier_cache[uid] = (cached_tier, now + USER_TIER_CACHE_TTL)
+                return cached_tier
+        except Exception as e:
+            print(f"[TeraBridge][WARN] Redis user tier cache get error: {e}", flush=True)
+
+    # 3. Query Firebase Realtime DB
+    token = getattr(request, "firebase_token", None)
+    if token:
+        try:
+            import requests
+            url = f"https://{FIREBASE_PROJECT_ID}-default-rtdb.asia-southeast1.firebasedatabase.app/users/{uid}/profile/tier.json?auth={token}"
+            r = requests.get(url, timeout=5)
+            if r.status_code == 200:
+                db_tier = r.json()
+                resolved_tier = "free"
+                if db_tier:
+                    tier_str = str(db_tier).lower()
+                    if "premium" in tier_str or "pro" in tier_str:
+                        resolved_tier = "premium"
+
+                # Save to local memory cache
+                with _user_tier_cache_lock:
+                    _user_tier_cache[uid] = (resolved_tier, now + USER_TIER_CACHE_TTL)
+
+                # Save to Redis cache if available
+                if redis_client:
+                    try:
+                        redis_client.set(f"user:tier:{uid}", resolved_tier, ex=USER_TIER_CACHE_TTL)
+                    except Exception as e:
+                        print(f"[TeraBridge][WARN] Redis user tier cache set error: {e}", flush=True)
+
+                return resolved_tier
+        except Exception as e:
+            print(f"[TeraBridge][WARN] Failed to fetch user tier from Firebase DB: {e}", flush=True)
+
+    return "free"
+
+
+def signature_ttl_for(kind, tier="free"):
+    """TTL (seconds) for a signed-URL purpose, falling back to the default."""
+    ttls = TIERED_SIGNATURE_TTLS.get(tier, TIERED_SIGNATURE_TTLS["free"])
+    return ttls.get(kind, DEFAULT_SIGNATURE_TTL)
+
+
+def generate_signature(param1, param2, param3="", exp=""):
+    """
+    HMAC-SHA256 signature over `param1|param2|param3|exp` using HMAC_SECRET.
+
+    `exp` is an absolute unix-expiry (string/int) baked into the signed
+    message so it cannot be tampered with. Pass exp="" for a non-expiring
+    signature (used only for backward-compatible verification of legacy URLs).
 
     HMAC_SECRET defaults to API_KEY when unset. If neither is configured,
     signing is disabled and an empty string is returned, which causes
@@ -562,21 +737,58 @@ def generate_signature(param1, param2, param3=""):
     """
     if not HMAC_SECRET:
         return ""
-    message = f"{param1}|{param2}|{param3}"
+    message = f"{param1}|{param2}|{param3}|{exp}"
     return hmac.new(HMAC_SECRET.encode(), message.encode(), hashlib.sha256).hexdigest()
 
 
-def verify_signature(param1, param2, param3, signature):
+def make_signed_params(param1, param2, param3="", kind="download"):
     """
-    Constant-time HMAC verification. Returns False on any missing input
-    or when HMAC signing is not configured.
+    Build the URL query fragment `sig=...&exp=...` for a signed proxy URL.
+
+    Returns "" when signing is disabled (no HMAC_SECRET). The expiry is
+    derived from the purpose `kind` via TIERED_SIGNATURE_TTLS.
+    """
+    if not HMAC_SECRET:
+        return ""
+    tier = get_user_tier()
+    exp = int(time.time()) + signature_ttl_for(kind, tier)
+    sig = generate_signature(param1, param2, param3, exp)
+    return f"sig={sig}&exp={exp}"
+
+
+def verify_signature(param1, param2, param3, signature, exp=""):
+    """
+    Constant-time HMAC verification with optional expiry.
+
+    - Returns False on any missing input or when HMAC signing is not configured.
+    - When `exp` is provided, the signature must cover that exact exp value AND
+      the deadline must not have passed.
+    - When `exp` is empty (legacy URLs minted before expiry existed), the
+      signature is verified against the old no-exp message and accepted —
+      grandfathering so saved libraries keep working. These are logged.
     """
     if not signature or not HMAC_SECRET:
         return False
-    expected = generate_signature(param1, param2, param3)
-    if not expected:
-        return False
-    return hmac.compare_digest(expected, signature)
+
+    if exp:
+        # Expiring signature: reject if the deadline has passed.
+        try:
+            if int(exp) < int(time.time()):
+                return False
+        except (TypeError, ValueError):
+            return False
+        expected = generate_signature(param1, param2, param3, exp)
+        if not expected:
+            return False
+        return hmac.compare_digest(expected, signature)
+
+    # ── Legacy / grandfathered path: signature minted without an exp ──
+    expected_legacy = generate_signature(param1, param2, param3, "")
+    if expected_legacy and hmac.compare_digest(expected_legacy, signature):
+        print("[TeraBridge][WARN] Accepted legacy un-expiring signed URL "
+              f"(p1={param1[:24]}...). Consider re-resolving to refresh.", flush=True)
+        return True
+    return False
 
 
 
@@ -603,8 +815,8 @@ def home():
 @app.route("/api/stats")
 def stats():
     """Observability endpoint for cache and rate limiter metrics."""
-    if not check_auth():
-        return jsonify({"status": "error", "message": "Unauthorized: Invalid or missing API key."}), 401
+    if not check_admin():
+        return jsonify({"status": "error", "message": "Unauthorized: Admin API key required."}), 401
     uptime = int(time.time() - _start_time)
     redis_status = "connected" if redis_client else "disabled"
     
@@ -654,8 +866,8 @@ def _format_resolved_response(res, link):
             for k, v in raw_thumbs.items():
                 if v:
                     if original_fs_id and surl:
-                        sig = generate_signature(surl, original_fs_id, k)
-                        proxy_url = f"{_request_base_url()}/api/thumbnail?surl={surl}&fs_id={original_fs_id}&size_type={k}&sig={sig}"
+                        signed = make_signed_params(surl, original_fs_id, k, kind="thumbnail")
+                        proxy_url = f"{_request_base_url()}/api/thumbnail?surl={surl}&fs_id={original_fs_id}&size_type={k}&{signed}"
                     else:
                         quoted_v = urllib.parse.quote(v)
                         proxy_url = f"{_request_base_url()}/api/thumbnail?url={quoted_v}"
@@ -666,14 +878,14 @@ def _format_resolved_response(res, link):
         # Shortened download proxy link
         dlink_url = f.get("dlink")
         if dlink_url and original_fs_id and surl:
-            sig = generate_signature(surl, original_fs_id, "")
-            proxy_dlink = f"{_request_base_url()}/api/download?surl={surl}&fs_id={original_fs_id}&sig={sig}"
+            signed = make_signed_params(surl, original_fs_id, "", kind="download")
+            proxy_dlink = f"{_request_base_url()}/api/download?surl={surl}&fs_id={original_fs_id}&{signed}"
         else:
             proxy_dlink = dlink_url
 
         if f.get("stream_ready") and original_fs_id and surl:
-            manifest_sig = generate_signature(surl, original_fs_id, "manifest")
-            proxy_stream = f"{_request_base_url()}/api/stream/manifest?surl={surl}&fs_id={original_fs_id}&sig={manifest_sig}"
+            signed = make_signed_params(surl, original_fs_id, "manifest", kind="manifest")
+            proxy_stream = f"{_request_base_url()}/api/stream/manifest?surl={surl}&fs_id={original_fs_id}&{signed}"
         else:
             proxy_stream = None
 
@@ -954,9 +1166,10 @@ def stream_manifest():
     surl = request.args.get("surl") or ""
     fs_id = request.args.get("fs_id") or ""
     sig = request.args.get("sig") or ""
+    exp = request.args.get("exp") or ""
 
     # Authorize either via master key/Firebase token OR via valid signature
-    is_authorized = check_auth() or (surl and fs_id and verify_signature(surl, fs_id, "manifest", sig))
+    is_authorized = check_auth() or (surl and fs_id and verify_signature(surl, fs_id, "manifest", sig, exp))
     if not is_authorized:
         return jsonify({"status": "error", "message": "Unauthorized: Invalid signature or authentication."}), 401
 
@@ -1043,8 +1256,8 @@ def stream_manifest():
             line_stripped = line.strip()
             if line_stripped and not line_stripped.startswith("#"):
                 quoted_url = urllib.parse.quote(line_stripped)
-                sig = generate_signature(line_stripped, "", "")
-                proxy_url = f"{_request_base_url()}/api/stream/segment?url={quoted_url}&sig={sig}"
+                signed = make_signed_params(line_stripped, "", "", kind="segment")
+                proxy_url = f"{_request_base_url()}/api/stream/segment?url={quoted_url}&{signed}"
                 proxied_lines.append(proxy_url)
             else:
                 proxied_lines.append(line)
@@ -1073,13 +1286,14 @@ def stream_segment():
 
     url = request.args.get("url") or ""
     sig = request.args.get("sig") or ""
+    exp = request.args.get("exp") or ""
     if not url:
         return "Missing segment URL", 400
 
     target_url = url
 
     # Authorize either via master key OR via valid signature
-    if not check_auth() and not verify_signature(target_url, "", "", sig):
+    if not check_auth() and not verify_signature(target_url, "", "", sig, exp):
         return "Unauthorized: Invalid signature or API key.", 401
 
     # SSRF Protection
@@ -1087,7 +1301,7 @@ def stream_segment():
         parsed = urllib.parse.urlparse(target_url)
         if parsed.scheme not in ("http", "https"):
             return "Forbidden: Unsupported URL scheme.", 403
-        domain = parsed.netloc.lower()
+        domain = parsed.hostname.lower() if parsed.hostname else ""
         # Trusted CDN roots that TeraBox hands out for HLS manifest/segment URIs.
         # An entry that starts with "." is a domain-suffix match; an entry
         # without a leading dot is matched exactly (e.g. "pcs.baidu.com").
@@ -1213,13 +1427,14 @@ def stream_thumbnail():
     fs_id = request.args.get("fs_id") or ""
     size_type = request.args.get("size_type") or request.args.get("size") or "url3"
     sig = request.args.get("sig") or ""
+    exp = request.args.get("exp") or ""
 
     if not url and not (surl and fs_id):
         return "Missing thumbnail URL or surl/fs_id parameters", 400
 
     # Authorize either via master key OR via valid signature
     if not url:
-        if not check_auth() and not verify_signature(surl, fs_id, size_type, sig):
+        if not check_auth() and not verify_signature(surl, fs_id, size_type, sig, exp):
             return "Unauthorized: Invalid signature or API key.", 401
     else:
         if not check_auth():
@@ -1258,7 +1473,7 @@ def stream_thumbnail():
     # SSRF Protection
     try:
         parsed = urllib.parse.urlparse(target_url)
-        domain = parsed.netloc.lower()
+        domain = parsed.hostname.lower() if parsed.hostname else ""
         allowed_suffixes = (
             # Core/Official
             ".1024terabox.com",
@@ -1344,12 +1559,13 @@ def download_file_route():
     surl = request.args.get("surl") or ""
     fs_id = request.args.get("fs_id") or ""
     sig = request.args.get("sig") or ""
+    exp = request.args.get("exp") or ""
 
     if not surl or not fs_id:
         return "Missing required parameters: surl and fs_id", 400
 
     # Authorize either via master key OR via valid signature
-    if not check_auth() and not verify_signature(surl, fs_id, "", sig):
+    if not check_auth() and not verify_signature(surl, fs_id, "", sig, exp):
         return "Unauthorized: Invalid signature or API key.", 401
 
     share_url = f"https://1024terabox.com/s/{surl}"
@@ -1502,8 +1718,8 @@ def admin_config():
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         return resp
 
-    if not check_auth():
-        return jsonify({"status": "error", "message": "Unauthorized: Invalid or missing API key."}), 401
+    if not check_admin():
+        return jsonify({"status": "error", "message": "Unauthorized: Admin API key required."}), 401
 
     if not redis_client:
         return jsonify({
