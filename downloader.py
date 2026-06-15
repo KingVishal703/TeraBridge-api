@@ -224,7 +224,7 @@ def show(label, r):
         print(f"  {r.text[:400]}")
         return {}
 
-def _process_single_file_metadata(item, share_id, uk, existing_files, action, wait_for_transcoding, bdstoken_val):
+def _process_single_file_metadata(item, share_id, uk, existing_files, action, wait_for_transcoding, bdstoken_val, quality=None):
     """
     Processes a single file from the shared link (transfer + streaming checks).
     This function is run in a ThreadPoolExecutor.
@@ -342,7 +342,10 @@ def _process_single_file_metadata(item, share_id, uk, existing_files, action, wa
         encoded_path = urllib.parse.quote(my_file_path)
         
         # Try multiple stream quality types — highest first
-        stream_types = ["M3U8_AUTO_720", "M3U8_AUTO_480", "M3U8_AUTO_360"]
+        if quality:
+            stream_types = [quality]
+        else:
+            stream_types = ["M3U8_AUTO_1080", "M3U8_AUTO_720", "M3U8_AUTO_480", "M3U8_AUTO_360"]
         
         def _try_stream(stype):
             """Try a single streaming request. Returns (success, errno, response_text)."""
@@ -420,7 +423,7 @@ def _process_single_file_metadata(item, share_id, uk, existing_files, action, wa
 
     return file_res
 
-def resolve_link(link, action="d", wait_for_transcoding=False):
+def resolve_link(link, action="d", wait_for_transcoding=False, quality=None):
     """
     Exposes the core resolution logic.
     Returns a dict with metadata, transfer status, direct links, or streaming playlists.
@@ -501,7 +504,8 @@ def resolve_link(link, action="d", wait_for_transcoding=False):
                 existing_files,
                 action,
                 wait_for_transcoding,
-                BDSTOKEN
+                BDSTOKEN,
+                quality
             ) for item in files_list
         ]
         results = [f.result() for f in futures_list]

@@ -1203,8 +1203,102 @@ def stream_manifest():
             "message": "Missing required parameter 'url', 'link' or 'surl'."
         }), 400
 
+    quality = request.args.get("quality") or request.args.get("type") or ""
+
+    qualities_to_check = {
+        "1080p": "M3U8_AUTO_1080",
+        "720p": "M3U8_AUTO_720",
+        "480p": "M3U8_AUTO_480",
+        "360p": "M3U8_AUTO_360"
+    }
+
     try:
-        res = resolve_link(link, action="s", wait_for_transcoding=wait_for_transcoding)
+        # CASE 1: Client wants the master multivariant playlist
+        if not quality:
+            import concurrent.futures
+            
+            ready_qualities = {}
+            
+            # Query all qualities in parallel
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                future_to_q = {
+                    executor.submit(resolve_link, link, action="s", wait_for_transcoding=wait_for_transcoding, quality=qtype): qname
+                    for qname, qtype in qualities_to_check.items()
+                }
+                for future in concurrent.futures.as_completed(future_to_q):
+                    qname = future_to_q[future]
+                    try:
+                        qres = future.result()
+                        if qres.get("errno") == 0:
+                            qfiles = qres.get("files", [])
+                            # Find matching file by fs_id or index
+                            matching_file = None
+                            if fs_id and qfiles:
+                                for f in qfiles:
+                                    if str(f.get("original_fs_id")) == str(fs_id) or str(f.get("fs_id")) == str(fs_id):
+                                        matching_file = f
+                                        break
+                            if not matching_file and qfiles and file_index < len(qfiles):
+                                matching_file = qfiles[file_index]
+                                
+                            if matching_file and matching_file.get("stream_ready"):
+                                ready_qualities[qname] = matching_file.get("stream_m3u8")
+                    except Exception as e:
+                        print(f"[Manifest][ERROR] Failed to check quality {qname}: {e}", flush=True)
+
+            if not ready_qualities:
+                # None of the resolutions are ready or transcoding. Try to get a standard resolution
+                res = resolve_link(link, action="s", wait_for_transcoding=wait_for_transcoding)
+                if res.get("errno") != 0:
+                    return jsonify({"status": "error", "message": res.get("error", "Unknown resolution error occurred.")}), 400
+                files = res.get("files", [])
+                is_transcoding = any(f.get("error") == "transcoding_in_progress" for f in files)
+                if is_transcoding:
+                    return jsonify({
+                        "status": "transcoding",
+                        "message": "HLS streaming manifest is currently transcoding. Please try again shortly."
+                    }), 202
+                return jsonify({
+                    "status": "error",
+                    "message": "No streamable video files found in this share link."
+                }), 404
+
+            # Construct Master Playlist
+            master_lines = ["#EXTM3U", "#EXT-X-VERSION:3"]
+            quality_metadata = {
+                "1080p": {"bandwidth": 4000000, "resolution": "1920x1080", "name": "1080p (Full HD)"},
+                "720p":  {"bandwidth": 2000000, "resolution": "1280x720",  "name": "720p (HD)"},
+                "480p":  {"bandwidth": 1000000, "resolution": "854x480",   "name": "480p (SD)"},
+                "360p":  {"bandwidth": 500000,  "resolution": "640x360",   "name": "360p (Low)"}
+            }
+
+            for qname in ["1080p", "720p", "480p", "360p"]:
+                if qname in ready_qualities:
+                    meta = quality_metadata[qname]
+                    base = f"{_request_base_url()}/api/stream/manifest"
+                    params = {
+                        "surl": surl,
+                        "fs_id": fs_id,
+                        "sig": sig,
+                        "exp": exp,
+                        "quality": qname,
+                        "index": file_index
+                    }
+                    qs = urllib.parse.urlencode(params)
+                    master_lines.append(f'#EXT-X-STREAM-INF:BANDWIDTH={meta["bandwidth"]},RESOLUTION={meta["resolution"]},NAME="{meta["name"]}"')
+                    master_lines.append(f"{base}?{qs}")
+
+            master_m3u8 = "\n".join(master_lines)
+            response = Response(master_m3u8, content_type="application/vnd.apple.mpegurl")
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            return response
+
+        # CASE 2: Client requested a specific quality stream playlist
+        qtype = qualities_to_check.get(quality.lower())
+        if not qtype:
+            qtype = "M3U8_AUTO_720"
+
+        res = resolve_link(link, action="s", wait_for_transcoding=wait_for_transcoding, quality=qtype)
         if res.get("errno") != 0:
             return jsonify({
                 "status": "error",
@@ -1215,19 +1309,12 @@ def stream_manifest():
         streamable_files = [f for f in files if f.get("stream_ready")]
 
         if not streamable_files:
-            is_transcoding = any(f.get("error") == "transcoding_in_progress" for f in files)
-            if is_transcoding:
-                return jsonify({
-                    "status": "transcoding",
-                    "message": "HLS streaming manifest is currently transcoding. Please try again shortly."
-                }), 202
             return jsonify({
                 "status": "error",
-                "message": "No streamable video files found in this share link."
-            }), 404
+                "message": "Requested quality stream not ready or transcoding."
+            }), 202
 
         if fs_id:
-            # Map fs_id to the exact streamable file
             matching_idx = -1
             for idx, f in enumerate(streamable_files):
                 if str(f.get("original_fs_id")) == str(fs_id) or str(f.get("fs_id")) == str(fs_id):
@@ -1272,6 +1359,8 @@ def stream_manifest():
         return response
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({
             "status": "error",
             "message": f"Manifest proxy error: {str(e)}"
